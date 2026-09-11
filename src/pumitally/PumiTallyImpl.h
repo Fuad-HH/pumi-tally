@@ -272,6 +272,7 @@ struct ParticleAtElemBoundary {
   // --- Node tally support ---
   Omega_h::LO num_vertices;                   //!< Number of mesh vertices
   Omega_h::Read<Omega_h::LO> elem2vert;       //!< Element-to-vertex connectivity
+  Omega_h::Reals mesh_coords;                 //!< Mesh vertex coordinates (for barycentric calcs)
 
   // --- Boundary condition ---
   BoundaryCondition boundary_condition;       //!< Active boundary condition

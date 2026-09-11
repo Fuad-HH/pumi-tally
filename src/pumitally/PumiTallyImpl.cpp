@@ -328,6 +328,7 @@ void PumiTallyImpl::AddNodeTally(
     const std::vector<uint> &number_of_non_spatial_filter_bins) {
   p_pumi_particle_at_elem_boundary_handler->AddNodeTally(
       number_of_non_spatial_filter_bins);
+  p_pumi_particle_at_elem_boundary_handler->mesh_coords = full_mesh.coords();
 }
 
 void PumiTallyImpl::UpdateFilterBins(const std::vector<uint> &bins) {
@@ -977,6 +978,9 @@ void ParticleAtElemBoundary::EvaluateFlux(
   // Element-to-vertex connectivity for node tallies (size: nelem*4 for tets)
   const auto e2v = elem2vert;
 
+  // Mesh vertex coordinates for barycentric weighting (set only if node tally active)
+  const auto coords_l = mesh_coords;
+
   auto evaluate_flux =
       PS_LAMBDA(const int &e, const int &pid, const int &mask) {
     if ((mask > 0) && (in_flight(pid) == 1) && !ptcl_done[pid]) {
@@ -1003,22 +1007,22 @@ void ParticleAtElemBoundary::EvaluateFlux(
         case 2:
           Kokkos::atomic_add(
               &elem_view(eid, filt_bins[pid * n_filt + 0],
-                         filt_bins[pid * n_filt + 1]),
+                              filt_bins[pid * n_filt + 1]),
               contribution);
           break;
         case 3:
           Kokkos::atomic_add(
               &elem_view(eid, filt_bins[pid * n_filt + 0],
-                         filt_bins[pid * n_filt + 1],
-                         filt_bins[pid * n_filt + 2]),
+                              filt_bins[pid * n_filt + 1],
+                              filt_bins[pid * n_filt + 2]),
               contribution);
           break;
         case 4:
           Kokkos::atomic_add(
               &elem_view(eid, filt_bins[pid * n_filt + 0],
-                         filt_bins[pid * n_filt + 1],
-                         filt_bins[pid * n_filt + 2],
-                         filt_bins[pid * n_filt + 3]),
+                              filt_bins[pid * n_filt + 1],
+                              filt_bins[pid * n_filt + 2],
+                              filt_bins[pid * n_filt + 3]),
               contribution);
           break;
         default:
@@ -1027,39 +1031,80 @@ void ParticleAtElemBoundary::EvaluateFlux(
       }
 
       if (has_node) {
-        // Distribute to the 4 vertices of the tet element (equal split)
-        Omega_h::Real vert_contrib = contribution / 4.0;
+        // Distribute to the 4 vertices using barycentric coordinates
+        // of the segment midpoint for physically accurate weighting
+        const Omega_h::Vector<3> midpoint = (dest + orig) / 2.0;
         Omega_h::LO eid = elem_ids[pid];
-        Omega_h::LO v0 = e2v[eid * 4 + 0];
-        Omega_h::LO v1 = e2v[eid * 4 + 1];
-        Omega_h::LO v2 = e2v[eid * 4 + 2];
-        Omega_h::LO v3 = e2v[eid * 4 + 3];
+
+        // Gather tet vertex coordinates
+        const auto tet_v2v = Omega_h::gather_verts<4>(e2v, eid);
+        const auto elem_coords =
+            Omega_h::gather_vectors<4, 3>(coords_l, tet_v2v);
+
+        // Compute tet volume for barycentric calculation
+        const Omega_h::Real tet_vol = volume_tet(elem_coords);
+
+        // Contribution needs to be normalized now
+        // instead of normalizing in the end
+        // because they will be distributed to the vertices
+        const Omega_h::Real normalized_contribution = contribution / tet_vol;
+
+        // Compute barycentric coordinates of the segment midpoint
+        Omega_h::Vector<4> bcc;
+        bool bcc_ok = pumipic::barycentric_tet(tet_vol, elem_coords, midpoint, bcc);
+
+        // Check if the barycentric coordinates are positive
+        if (bcc[0] < 0.0 || bcc[1] < 0.0 || bcc[2] < 0.0 || bcc[3] < 0.0) {
+          printf("[WARN] Barycentric coordinates are negative, using equal split: %f %f %f %f\n", bcc[0], bcc[1], bcc[2], bcc[3]);
+          printf("[WARN] Failed for element %d, volume %f, midpoint (%f, %f, %f)\n", eid, tet_vol, midpoint[0], midpoint[1], midpoint[2]);
+          bcc_ok = false;
+        }
+
+        // Compute per-vertex contributions (fall back to equal split on failure)
+        Omega_h::Real w0, w1, w2, w3;
+        if (bcc_ok) {
+          w0 = normalized_contribution * bcc[0];
+          w1 = normalized_contribution * bcc[1];
+          w2 = normalized_contribution * bcc[2];
+          w3 = normalized_contribution * bcc[3];
+        } else {
+          Omega_h::Real vert_contrib = normalized_contribution / 4.0;
+          printf("[WARN] Barycentric calculation failed, using equal split: %f\n", vert_contrib);
+          printf("[WARN] Failed for element %d, volume %f, midpoint (%f, %f, %f)\n", eid, tet_vol, midpoint[0], midpoint[1], midpoint[2]);
+          
+          w0 = w1 = w2 = w3 = vert_contrib;
+        }
+
+        const Omega_h::LO v0 = tet_v2v[0];
+        const Omega_h::LO v1 = tet_v2v[1];
+        const Omega_h::LO v2 = tet_v2v[2];
+        const Omega_h::LO v3 = tet_v2v[3];
         switch (n_filt) {
         case 1: {
           auto b0 = filt_bins[pid * n_filt + 0];
-          Kokkos::atomic_add(&node_view(v0, b0), vert_contrib);
-          Kokkos::atomic_add(&node_view(v1, b0), vert_contrib);
-          Kokkos::atomic_add(&node_view(v2, b0), vert_contrib);
-          Kokkos::atomic_add(&node_view(v3, b0), vert_contrib);
+          Kokkos::atomic_add(&node_view(v0, b0), w0);
+          Kokkos::atomic_add(&node_view(v1, b0), w1);
+          Kokkos::atomic_add(&node_view(v2, b0), w2);
+          Kokkos::atomic_add(&node_view(v3, b0), w3);
           break;
         }
         case 2: {
           auto b0 = filt_bins[pid * n_filt + 0];
           auto b1 = filt_bins[pid * n_filt + 1];
-          Kokkos::atomic_add(&node_view(v0, b0, b1), vert_contrib);
-          Kokkos::atomic_add(&node_view(v1, b0, b1), vert_contrib);
-          Kokkos::atomic_add(&node_view(v2, b0, b1), vert_contrib);
-          Kokkos::atomic_add(&node_view(v3, b0, b1), vert_contrib);
+          Kokkos::atomic_add(&node_view(v0, b0, b1), w0);
+          Kokkos::atomic_add(&node_view(v1, b0, b1), w1);
+          Kokkos::atomic_add(&node_view(v2, b0, b1), w2);
+          Kokkos::atomic_add(&node_view(v3, b0, b1), w3);
           break;
         }
         case 3: {
           auto b0 = filt_bins[pid * n_filt + 0];
           auto b1 = filt_bins[pid * n_filt + 1];
           auto b2 = filt_bins[pid * n_filt + 2];
-          Kokkos::atomic_add(&node_view(v0, b0, b1, b2), vert_contrib);
-          Kokkos::atomic_add(&node_view(v1, b0, b1, b2), vert_contrib);
-          Kokkos::atomic_add(&node_view(v2, b0, b1, b2), vert_contrib);
-          Kokkos::atomic_add(&node_view(v3, b0, b1, b2), vert_contrib);
+          Kokkos::atomic_add(&node_view(v0, b0, b1, b2), w0);
+          Kokkos::atomic_add(&node_view(v1, b0, b1, b2), w1);
+          Kokkos::atomic_add(&node_view(v2, b0, b1, b2), w2);
+          Kokkos::atomic_add(&node_view(v3, b0, b1, b2), w3);
           break;
         }
         case 4: {
@@ -1067,10 +1112,10 @@ void ParticleAtElemBoundary::EvaluateFlux(
           auto b1 = filt_bins[pid * n_filt + 1];
           auto b2 = filt_bins[pid * n_filt + 2];
           auto b3 = filt_bins[pid * n_filt + 3];
-          Kokkos::atomic_add(&node_view(v0, b0, b1, b2, b3), vert_contrib);
-          Kokkos::atomic_add(&node_view(v1, b0, b1, b2, b3), vert_contrib);
-          Kokkos::atomic_add(&node_view(v2, b0, b1, b2, b3), vert_contrib);
-          Kokkos::atomic_add(&node_view(v3, b0, b1, b2, b3), vert_contrib);
+          Kokkos::atomic_add(&node_view(v0, b0, b1, b2, b3), w0);
+          Kokkos::atomic_add(&node_view(v1, b0, b1, b2, b3), w1);
+          Kokkos::atomic_add(&node_view(v2, b0, b1, b2, b3), w2);
+          Kokkos::atomic_add(&node_view(v3, b0, b1, b2, b3), w3);
           break;
         }
         default:
@@ -1152,7 +1197,8 @@ void ParticleAtElemBoundary::FinalizeTallies(
            spec.total_filter_bins, nelem);
   }
 
-  // 3. Multi-dimensional node tally (not volume-normalized)
+  // 3. Multi-dimensional node tally
+  // Not volume-normalized because it is already normalized in the flux evaluation loop
   if (node_tally_spec.is_initialized) {
     const auto &spec = node_tally_spec;
     auto node_data = node_tallies.data();

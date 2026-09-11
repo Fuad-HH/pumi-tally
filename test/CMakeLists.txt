@@ -45,4 +45,12 @@ target_compile_definitions(test_new_api_integration PRIVATE
 )
 target_link_libraries(test_new_api_integration PUBLIC Catch2::Catch2WithMain pumipic::pumipic pumitally)
 catch_discover_tests(test_new_api_integration)
+
+add_executable(test_tally_consistency integration_test/test_tally_consistency.cpp)
+target_include_directories(test_tally_consistency PRIVATE ${PROJECT_SOURCE_DIR}/src/pumitally)
+target_compile_definitions(test_tally_consistency PRIVATE
+    TEST_MESH_FILE="${PROJECT_SOURCE_DIR}/test/assets/tet6-222.osh"
+)
+target_link_libraries(test_tally_consistency PUBLIC Catch2::Catch2WithMain pumipic::pumipic pumitally)
+catch_discover_tests(test_tally_consistency)
 #################### Test HostWrite ####################

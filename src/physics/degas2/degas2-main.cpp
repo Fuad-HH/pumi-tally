@@ -148,7 +148,7 @@ void Transport(pumitally::PumiTallyImpl &pumi_tally, DG2Physics &physics,
                const Kokkos::View<double *> &initial_alpha,
                int max_iterations) {
 
-  // --- Register an element tally with a single energy filter ---
+  // --- Register a node tally with a single energy filter ---
   pumi_tally.AddElementTally({NUM_ENERGY_BINS});
 
   // --- Enable reflective boundary condition ---
