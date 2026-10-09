@@ -11,6 +11,7 @@
 #include <pumipic_mesh.hpp>
 #include <pumipic_ptcl_ops.hpp>
 
+#include "P1TallySolver.h"
 #include "PumiTallyImpl.h"
 
 namespace pumitally {
@@ -49,6 +50,16 @@ PumiTallyImpl::PumiTallyImpl(const std::string &mesh_filename,
       ParticleTracer<PPParticle, pumitally::ParticleAtElemBoundary>>(
       *p_picparts, pumipic_ptcls.get(),
       *p_pumi_particle_at_elem_boundary_handler, 1e-8);
+}
+
+PumiTallyImpl::~PumiTallyImpl() {
+  // PETSc objects held by the handler must go before PETSc is finalized, and
+  // PETSc must be finalized before pumipic_lib finalizes MPI
+  p_particle_tracer.reset();
+  p_pumi_particle_at_elem_boundary_handler.reset();
+  if (owns_petsc) {
+    PetscFinalize();
+  }
 }
 
 void PumiTallyImpl::CopyInitialPositionToBuffer(double *init_particle_positions,
@@ -254,6 +265,16 @@ void PumiTallyImpl::CopyLocationsToBuffer(double *particle_positions) const {
 void PumiTallyImpl::InitPUMILibrary(int &argc, char **&argv) {
   pumipic_lib = std::make_unique<pumipic::Library>(&argc, &argv);
   oh_lib = pumipic_lib->omega_h_lib();
+
+  // MPI and Kokkos are up now; PETSc reuses both. argv is passed so that
+  // -ksp_* / -pc_* options reach the P1 tally solver
+  PetscBool petsc_initialized = PETSC_FALSE;
+  PetscCallAbort(PETSC_COMM_SELF, PetscInitialized(&petsc_initialized));
+  if (!petsc_initialized) {
+    PetscCallAbort(PETSC_COMM_SELF,
+                   PetscInitialize(&argc, &argv, nullptr, nullptr));
+    owns_petsc = true;
+  }
 }
 
 void UpdateCurrentElement(PPPS *ptcls,
@@ -307,15 +328,20 @@ void ApplyVacuumBC(const Omega_h::Mesh &mesh, PPPS *ptcls,
                         "apply vacumm boundary condition");
 }
 
-ParticleAtElemBoundary::ParticleAtElemBoundary(const Omega_h::LO num_elements,
+ParticleAtElemBoundary::ParticleAtElemBoundary(Omega_h::Mesh &mesh,
                                                const Omega_h::LO capacity)
-    : is_initial_track(true), flux(num_elements, 0.0, "flux"),
-      flux_sum(num_elements, 0.0, "flux_sum"),
-      flux_sum_sq(num_elements, 0.0, "flux_sum_sq"),
-      prev_xpoint(capacity * 3, 0.0, "prev_xpoint") {
-  printf("[INFO] Particle handler at boundary with %d elements and %d "
-         "x points size (3 * n_particles)\n",
-         flux.size(), prev_xpoint.size());
+    : is_initial_track(true), flux(mesh.nelems(), 0.0, "flux"),
+      flux_sum(mesh.nelems(), 0.0, "flux_sum"),
+      flux_sum_sq(mesh.nelems(), 0.0, "flux_sum_sq"),
+      prev_xpoint(capacity * 3, 0.0, "prev_xpoint"),
+      elem2verts(mesh.ask_elem_verts()), coords(mesh.coords()),
+      p1_rhs(mesh.nverts(), 0.0, "p1_rhs"),
+      p1_flux_sum(mesh.nverts(), 0.0, "p1_flux_sum"),
+      p1_flux_sum_sq(mesh.nverts(), 0.0, "p1_flux_sum_sq"),
+      p1_solver(std::make_shared<P1TallySolver>(mesh)) {
+  printf("[INFO] Particle handler at boundary with %d elements, %d vertices "
+         "and %d x points size (3 * n_particles)\n",
+         flux.size(), p1_rhs.size(), prev_xpoint.size());
 }
 
 void ParticleAtElemBoundary::operator()(
@@ -379,6 +405,9 @@ void ParticleAtElemBoundary::EvaluateFlux(
     const Omega_h::Write<Omega_h::LO> &ptcl_done) const {
   const auto prev_xpoint_l = prev_xpoint;
   const auto flux_l = flux;
+  const auto p1_rhs_l = p1_rhs;
+  const auto elem2verts_l = elem2verts;
+  const auto coords_l = coords;
   const auto in_flight = ptcls->get<3>();
   const auto p_wgt = ptcls->get<4>();
   const auto &xpoints_l = xpoints; // todo shouldn't need it, so remove
@@ -398,6 +427,17 @@ void ParticleAtElemBoundary::EvaluateFlux(
 
       const Omega_h::Real contribution = segment_length * p_wgt(pid);
       Kokkos::atomic_add(&flux_l[elem_ids[pid]], contribution);
+
+      // P1: int_segment(N_v) dl = L * N_v(midpoint) since N_v is linear
+      const auto elem_verts = Omega_h::gather_verts<4>(elem2verts_l, elem_ids[pid]);
+      const auto elem_vert_coords =
+          Omega_h::gather_vectors<4, 3>(coords_l, elem_verts);
+      const Omega_h::Vector<3> midpoint = 0.5 * (orig + dest);
+      const auto bcc =
+          Omega_h::barycentric_from_global<3, 3>(midpoint, elem_vert_coords);
+      for (int i = 0; i < 4; ++i) {
+        Kokkos::atomic_add(&p1_rhs_l[elem_verts[i]], contribution * bcc[i]);
+      }
     }
   };
   pumipic::parallel_for(ptcls, evaluate_flux, "flux evaluation loop");
@@ -417,6 +457,26 @@ void ParticleAtElemBoundary::AccumulateBatchFlux(
   };
   Omega_h::parallel_for(flux.size(), accumulate, "accumulate batch flux");
 
+  // P1: phi = M^{-1} (normalization_factor * rhs), statistics on phi
+  const auto p1_rhs_l = p1_rhs;
+  auto scale_rhs = OMEGA_H_LAMBDA(const Omega_h::LO vert_id) {
+    p1_rhs_l[vert_id] *= normalization_factor;
+  };
+  Omega_h::parallel_for(p1_rhs.size(), scale_rhs, "scale batch P1 rhs");
+
+  const Omega_h::Reals phi = p1_solver->Solve(Omega_h::Reals(p1_rhs));
+
+  const auto p1_flux_sum_l = p1_flux_sum;
+  const auto p1_flux_sum_sq_l = p1_flux_sum_sq;
+  auto accumulate_p1 = OMEGA_H_LAMBDA(const Omega_h::LO vert_id) {
+    const Omega_h::Real value = phi[vert_id];
+    p1_flux_sum_l[vert_id] += value;
+    p1_flux_sum_sq_l[vert_id] += value * value;
+    p1_rhs_l[vert_id] = 0.0;
+  };
+  Omega_h::parallel_for(p1_rhs.size(), accumulate_p1,
+                        "accumulate batch P1 flux");
+
   n_realizations++;
 }
 
@@ -426,37 +486,55 @@ void ParticleAtElemBoundary::DiscardBatchFlux() const {
     flux_l[elem_id] = 0.0;
   };
   Omega_h::parallel_for(flux.size(), reset, "reset batch flux");
+
+  const auto p1_rhs_l = p1_rhs;
+  auto reset_p1 = OMEGA_H_LAMBDA(const Omega_h::LO vert_id) {
+    p1_rhs_l[vert_id] = 0.0;
+  };
+  Omega_h::parallel_for(p1_rhs.size(), reset_p1, "reset batch P1 rhs");
 }
 
 std::pair<Omega_h::Reals, Omega_h::Reals>
-ParticleAtElemBoundary::ComputeMeanAndStdDev() const {
+MeanAndStdDev(const Omega_h::Write<Omega_h::Real> &sum,
+              const Omega_h::Write<Omega_h::Real> &sum_sq,
+              const Omega_h::LO n_realizations) {
   OMEGA_H_CHECK_PRINTF(n_realizations > 0,
                        "Cannot compute statistics from %d batches\n",
                        n_realizations);
 
-  const auto flux_sum_l = flux_sum;
-  const auto flux_sum_sq_l = flux_sum_sq;
+  const auto sum_l = sum;
+  const auto sum_sq_l = sum_sq;
   const auto n = static_cast<Omega_h::Real>(n_realizations);
 
-  const Omega_h::Write<Omega_h::Real> mean(flux_sum.size(), 0.0, "flux_mean");
-  const Omega_h::Write<Omega_h::Real> std_dev(flux_sum.size(), 0.0,
+  const Omega_h::Write<Omega_h::Real> mean(sum.size(), 0.0, "flux_mean");
+  const Omega_h::Write<Omega_h::Real> std_dev(sum.size(), 0.0,
                                               "flux_std_dev");
 
-  auto compute_statistics = OMEGA_H_LAMBDA(const Omega_h::LO elem_id) {
-    const Omega_h::Real elem_mean = flux_sum_l[elem_id] / n;
-    mean[elem_id] = elem_mean;
+  auto compute_statistics = OMEGA_H_LAMBDA(const Omega_h::LO id) {
+    const Omega_h::Real id_mean = sum_l[id] / n;
+    mean[id] = id_mean;
     // a single realization gives no estimate of the spread
     if (n > 1.0) {
       const Omega_h::Real variance =
-          (flux_sum_sq_l[elem_id] / n - elem_mean * elem_mean) / (n - 1.0);
+          (sum_sq_l[id] / n - id_mean * id_mean) / (n - 1.0);
       // round off can make the variance slightly negative for a flat tally
-      std_dev[elem_id] = (variance > 0.0) ? Kokkos::sqrt(variance) : 0.0;
+      std_dev[id] = (variance > 0.0) ? Kokkos::sqrt(variance) : 0.0;
     }
   };
-  Omega_h::parallel_for(flux_sum.size(), compute_statistics,
+  Omega_h::parallel_for(sum.size(), compute_statistics,
                         "compute flux mean and std dev");
 
   return {Omega_h::Reals(mean), Omega_h::Reals(std_dev)};
+}
+
+std::pair<Omega_h::Reals, Omega_h::Reals>
+ParticleAtElemBoundary::ComputeMeanAndStdDev() const {
+  return MeanAndStdDev(flux_sum, flux_sum_sq, n_realizations);
+}
+
+std::pair<Omega_h::Reals, Omega_h::Reals>
+ParticleAtElemBoundary::ComputeP1MeanAndStdDev() const {
+  return MeanAndStdDev(p1_flux_sum, p1_flux_sum_sq, n_realizations);
 }
 
 Omega_h::Reals ElementVolumes(Omega_h::Mesh &mesh) {
@@ -514,6 +592,16 @@ void ParticleAtElemBoundary::FinalizeTallies(Omega_h::Mesh &full_mesh,
   full_mesh.add_tag(Omega_h::REGION, "flux", 1, DivideByVolume(mean, volumes));
   full_mesh.add_tag(Omega_h::REGION, "flux_std_dev", 1,
                     DivideByVolume(std_dev, volumes));
+
+  // P1 nodal flux: M^{-1} b already gives the FE coefficients, so it is not
+  // divided by volume. The tracking mesh and full_mesh share vertex numbering
+  // on a single rank, as they share element numbering for the histogram.
+  OMEGA_H_CHECK_PRINTF(full_mesh.nverts() == p1_flux_sum.size(),
+                       "P1 tally has %d vertices but output mesh has %d\n",
+                       p1_flux_sum.size(), full_mesh.nverts());
+  const auto [p1_mean, p1_std_dev] = ComputeP1MeanAndStdDev();
+  full_mesh.add_tag(Omega_h::VERT, "flux_p1", 1, p1_mean);
+  full_mesh.add_tag(Omega_h::VERT, "flux_p1_std_dev", 1, p1_std_dev);
 
   // Both .osh and .vtk are written. Later, .vtk will be dropped.
   Omega_h::binary::write(filename + ".osh", &full_mesh);
@@ -648,7 +736,7 @@ void PumiTallyImpl::InitializePUMIParticleStructure(Omega_h::Mesh &mesh) {
   InitializeParticlesInElement0(mesh, pumipic_ptcls.get());
   p_pumi_particle_at_elem_boundary_handler =
       std::make_unique<pumitally::ParticleAtElemBoundary>(
-          mesh.nelems(), pumipic_ptcls->capacity());
+          mesh, pumipic_ptcls->capacity());
 
   printf("PumiPIC Mesh and data structure created with %d and %d as particle "
          "structure capacity\n",

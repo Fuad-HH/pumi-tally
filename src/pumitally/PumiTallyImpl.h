@@ -10,7 +10,11 @@
 #include <pumipic_library.hpp>
 #include <pumipic_mesh.hpp>
 
+#include <memory>
+
 namespace pumitally {
+
+class P1TallySolver;
 
 /**
  *  Data structure to hold the timing information for different sections
@@ -45,11 +49,11 @@ using PPExeSpace =
 
 struct ParticleAtElemBoundary {
   /**
-   * Allocates tally and other arrays
-   * @param num_elements Number of mesh elements
+   * Allocates tally and other arrays and builds the P1 mass matrix solver
+   * @param mesh Omega_h mesh the particles are tracked on
    * @param capacity PUMI-PiC Particle DS capacity
    */
-  ParticleAtElemBoundary(Omega_h::LO num_elements, Omega_h::LO capacity);
+  ParticleAtElemBoundary(Omega_h::Mesh &mesh, Omega_h::LO capacity);
 
   /**
    * @brief This operator is called by the ParticleTracer to do user defined
@@ -108,6 +112,10 @@ struct ParticleAtElemBoundary {
    * @details
    * Calculates the tracks segment length inside the current element and
    * it is multiplied with the particle weight before accumulating in the tally
+   * @n The same score is also distributed to the four vertices of the element
+   * with the P1 basis functions evaluated at the segment midpoint (exact for
+   * linear basis functions along a straight segment) and accumulated in the
+   * P1 load vector @ref p1_rhs.
    *
    * @see operator()
    */
@@ -129,6 +137,10 @@ struct ParticleAtElemBoundary {
    * @ref n_realizations, and zeroes @ref flux so the next batch starts clean.
    * One call per *active* batch is what makes the mean and the standard
    * deviation reported by @ref FinalizeTallies meaningful.
+   * @n For the P1 tally the load vector @ref p1_rhs is scaled with
+   * @p normalization_factor, the batch nodal flux `phi = M^{-1} rhs` is
+   * obtained with a linear solve, `phi` and `phi^2` are added to
+   * @ref p1_flux_sum and @ref p1_flux_sum_sq, and @ref p1_rhs is zeroed.
    *
    * @see DiscardBatchFlux
    */
@@ -138,8 +150,8 @@ struct ParticleAtElemBoundary {
    * Throw away the flux tallied in the current batch
    * @details Used for batches that must not contribute to the result (the
    * inactive batches of an eigenvalue calculation, for instance). It only
-   * zeroes @ref flux; @ref flux_sum, @ref flux_sum_sq and @ref n_realizations
-   * are left untouched.
+   * zeroes @ref flux and @ref p1_rhs; the running sums and
+   * @ref n_realizations are left untouched and no linear solve is done.
    */
   void DiscardBatchFlux() const;
 
@@ -154,6 +166,9 @@ struct ParticleAtElemBoundary {
    * tallied so far is accumulated as a single unnormalized batch first, so a
    * single batch run still reports its flux as the mean with a zero standard
    * deviation.
+   * @n The P1 nodal flux is written as the `flux_p1` and `flux_p1_std_dev`
+   * vertex tags. It is not divided by volume since `M^{-1} b` already gives
+   * the nodal finite element coefficients.
    *
    * @see AccumulateBatchFlux
    */
@@ -174,6 +189,16 @@ struct ParticleAtElemBoundary {
   std::pair<Omega_h::Reals, Omega_h::Reals> ComputeMeanAndStdDev() const;
 
   /**
+   * Mean and standard deviation of the P1 nodal flux over the accumulated
+   * batches
+   * @return A pair of `{mean, std_dev}` vertex arrays (no volume division)
+   *
+   * @details Same estimator as @ref ComputeMeanAndStdDev applied to the
+   * solved per-batch nodal fluxes, not to the load vectors.
+   */
+  std::pair<Omega_h::Reals, Omega_h::Reals> ComputeP1MeanAndStdDev() const;
+
+  /**
    * Mark the tracking step as is_initial_track step
    * @details It turns off tallying for this step
    * @param is_initial If it is initial
@@ -188,6 +213,17 @@ struct ParticleAtElemBoundary {
   Omega_h::Write<Omega_h::Real> prev_xpoint; //!< Previous intersection point
   Omega_h::LO n_realizations =
       0; //!< Number of batches folded into @ref flux_sum
+
+  Omega_h::LOs elem2verts; //!< Element to vertex adjacency of tracking mesh
+  Omega_h::Reals coords;   //!< Vertex coordinates of tracking mesh
+  Omega_h::Write<Omega_h::Real>
+      p1_rhs; //!< Current batch P1 load vector `b_v = sum(w * L * N_v)`
+  Omega_h::Write<Omega_h::Real>
+      p1_flux_sum; //!< Sum of the per batch nodal fluxes `M^{-1} b`
+  Omega_h::Write<Omega_h::Real>
+      p1_flux_sum_sq; //!< Sum of the squared per batch nodal fluxes
+  std::shared_ptr<P1TallySolver>
+      p1_solver; //!< Cached mass matrix solver (built once)
 };
 
 /**
@@ -212,6 +248,7 @@ struct PumiTallyImpl {
 
   long double pumipic_tol = 1e-8;      //!< Geometric comparison tolerance
   bool is_pumipic_initialized = false; //!< State of array allocations
+  bool owns_petsc = false; //!< If PETSc was initialized by PUMI-Tally
   Omega_h::LO iter_count = 0; //!< Number of iterations for each move call
   double total_initial_weight =
       0.0; //!< Total is_initial_track weight (needed for normalization)
@@ -234,7 +271,7 @@ struct PumiTallyImpl {
   PumiTallyImpl(const std::string &mesh_filename, Omega_h::LO num_ptcls,
                 int argc, char **argv);
 
-  ~PumiTallyImpl() = default;
+  ~PumiTallyImpl();
 
   void InitializePUMIParticleStructure(Omega_h::Mesh &mesh);
 

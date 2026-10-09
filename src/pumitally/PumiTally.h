@@ -136,6 +136,10 @@ public:
    * Writes the `flux` (mean over the accumulated batches) and `flux_std_dev`
    * (standard deviation of that mean) tags, both normalized by element volume,
    * along with the `volume` tag.
+   * @n The continuous P1 nodal flux is written as the `flux_p1` and
+   * `flux_p1_std_dev` vertex tags. Each batch's nodal flux is obtained by
+   * solving `M phi = b` with the consistent P1 mass matrix `M` and the
+   * sampled track-length load vector `b`; it is not divided by volume.
    *
    * @note If no batch was ever closed with @ref AccumulateBatchTally, whatever
    * was tallied so far is reported as a single unnormalized batch, which gives

@@ -19,6 +19,21 @@ else()
 endif()
 ###################################################################
 
+################################## PETSc ##########################
+find_package(PkgConfig REQUIRED)
+pkg_search_module(PETSC REQUIRED IMPORTED_TARGET PETSc>=3.23)
+message(STATUS "Found PETSc ${PETSC_VERSION}")
+
+# P1 tally passes Kokkos device arrays directly to PETSc
+include(CheckSymbolExists)
+set(CMAKE_REQUIRED_INCLUDES ${PETSC_INCLUDE_DIRS})
+check_symbol_exists(PETSC_HAVE_KOKKOS petscconf.h PUMITALLY_PETSC_HAS_KOKKOS)
+unset(CMAKE_REQUIRED_INCLUDES)
+if(NOT PUMITALLY_PETSC_HAS_KOKKOS)
+    message(FATAL_ERROR "PETSc must be built with Kokkos (same backend as PUMI-PiC)")
+endif()
+###################################################################
+
 ####################### Headers and Sources #######################
 set(PUMITALLY_HEADERS
         src/pumitally/PumiTally.h
@@ -28,6 +43,7 @@ set(PUMITALLY_HEADERS
 set(PUMITALLY_SOURCES
         src/pumitally/PumiTally.cpp
         src/pumitally/PumiTallyImpl.cpp
+        src/pumitally/P1TallySolver.cpp
 )
 
 
@@ -55,7 +71,7 @@ set(CMAKE_BUILD_RPATH "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}")
 ################################## Create Library #################
 add_library(pumitally)
 target_sources(pumitally PRIVATE ${PUMITALLY_SOURCES})
-target_link_libraries(pumitally PRIVATE pumipic::pumipic)
+target_link_libraries(pumitally PRIVATE pumipic::pumipic PkgConfig::PETSC)
 if(PUMITALLY_USE_KOKKOS_CUDA)
     target_compile_definitions(pumitally PRIVATE -DPUMITALLY_USE_KOKKOS_CUDA)
     if (CMAKE_BUILD_TYPE STREQUAL "Debug")
