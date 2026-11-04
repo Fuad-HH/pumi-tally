@@ -36,7 +36,6 @@ TEST_CASE("Test Degas2 Physics Functions") {
           particles(i).direction[0] = 1.0;
           particles(i).direction[1] = 0;
           particles(i).direction[2] = 0;
-          particles(i).energy_group = energy;
           particles(i).weight = 1.0;
           particles(i).particle_index = i;
           particles(i).alpha = 1.0;
