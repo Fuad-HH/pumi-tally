@@ -30,8 +30,9 @@ void TallyTimes::PrintTimes() const {
 }
 
 PumiTallyImpl::PumiTallyImpl(const std::string &mesh_filename,
-                             const Omega_h::LO num_ptcls, int argc, char **argv)
-    : num_particles(num_ptcls) {
+                             const Omega_h::LO num_ptcls, int argc, char **argv,
+                             const Estimator estimator)
+    : num_particles(num_ptcls), estimator(estimator) {
   oh_mesh_filename = mesh_filename;
 
   position_dev_buffer = Omega_h::Write<Omega_h::Real>(num_particles * 3, 0.0,
@@ -329,8 +330,10 @@ void ApplyVacuumBC(const Omega_h::Mesh &mesh, PPPS *ptcls,
 }
 
 ParticleAtElemBoundary::ParticleAtElemBoundary(Omega_h::Mesh &mesh,
-                                               const Omega_h::LO capacity)
-    : is_initial_track(true), flux(mesh.nelems(), 0.0, "flux"),
+                                               const Omega_h::LO capacity,
+                                               const Estimator estimator)
+    : is_initial_track(true), estimator(estimator),
+      flux(mesh.nelems(), 0.0, "flux"),
       flux_sum(mesh.nelems(), 0.0, "flux_sum"),
       flux_sum_sq(mesh.nelems(), 0.0, "flux_sum_sq"),
       prev_xpoint(capacity * 3, 0.0, "prev_xpoint"),
@@ -357,7 +360,7 @@ void ParticleAtElemBoundary::operator()(
     decltype(ptcls->get<1>()) dest_segment)
     const { // NOLINT(performance-unnecessary-value-param)
   if (!is_initial_track) {
-    EvaluateFlux(ptcls, inter_points, elem_ids, ptcl_done);
+    EvaluateFlux(ptcls, inter_points, elem_ids, last_exit, ptcl_done);
     UpdatePreviousXPoints(inter_points);
   }
   ApplyVacuumBC(mesh, ptcls, elem_ids, next_elems, ptcl_done, last_exit,
@@ -402,7 +405,9 @@ void ParticleAtElemBoundary::UpdatePreviousXPoints(PPPS *ptcls) const {
 void ParticleAtElemBoundary::EvaluateFlux(
     PPPS *ptcls, const Omega_h::Write<Omega_h::Real> &xpoints,
     const Omega_h::Write<Omega_h::LO> &elem_ids,
+    const Omega_h::Write<Omega_h::LO> &last_exit,
     const Omega_h::Write<Omega_h::LO> &ptcl_done) const {
+  const bool collision = estimator == Estimator::Collision;
   const auto prev_xpoint_l = prev_xpoint;
   const auto flux_l = flux;
   const auto p1_rhs_l = p1_rhs;
@@ -414,7 +419,10 @@ void ParticleAtElemBoundary::EvaluateFlux(
 
   auto evaluate_flux =
       PS_LAMBDA(const int &e, const int &pid, const int &mask) {
-    if ((mask > 0) && (in_flight(pid) == 1) && !ptcl_done[pid]) {
+    // the collision estimator only scores where the particle reaches its
+    // destination (last_exit == -1), i.e. the collision site
+    if ((mask > 0) && (in_flight(pid) == 1) && !ptcl_done[pid] &&
+        (!collision || last_exit[pid] == -1)) {
       const Omega_h::Vector<3> dest = {xpoints_l[pid * 3 + 0],
                                        xpoints_l[pid * 3 + 1],
                                        xpoints_l[pid * 3 + 2]};
@@ -425,16 +433,20 @@ void ParticleAtElemBoundary::EvaluateFlux(
       // TODO: Get total number of particles and divide here
       const Omega_h::Real segment_length = Omega_h::norm(dest - orig);
 
-      const Omega_h::Real contribution = segment_length * p_wgt(pid);
+      // collision: the weight is already w / Sigma_t
+      const Omega_h::Real contribution =
+          collision ? p_wgt(pid) : segment_length * p_wgt(pid);
       Kokkos::atomic_add(&flux_l[elem_ids[pid]], contribution);
 
-      // P1: int_segment(N_v) dl = L * N_v(midpoint) since N_v is linear
+      // P1: int_segment(N_v) dl = L * N_v(midpoint) since N_v is linear;
+      // the collision estimator evaluates N_v at the collision site
       const auto elem_verts = Omega_h::gather_verts<4>(elem2verts_l, elem_ids[pid]);
       const auto elem_vert_coords =
           Omega_h::gather_vectors<4, 3>(coords_l, elem_verts);
-      const Omega_h::Vector<3> midpoint = 0.5 * (orig + dest);
+      const Omega_h::Vector<3> score_point =
+          collision ? dest : 0.5 * (orig + dest);
       const auto bcc =
-          Omega_h::barycentric_from_global<3, 3>(midpoint, elem_vert_coords);
+          Omega_h::barycentric_from_global<3, 3>(score_point, elem_vert_coords);
       for (int i = 0; i < 4; ++i) {
         Kokkos::atomic_add(&p1_rhs_l[elem_verts[i]], contribution * bcc[i]);
       }
@@ -736,7 +748,7 @@ void PumiTallyImpl::InitializePUMIParticleStructure(Omega_h::Mesh &mesh) {
   InitializeParticlesInElement0(mesh, pumipic_ptcls.get());
   p_pumi_particle_at_elem_boundary_handler =
       std::make_unique<pumitally::ParticleAtElemBoundary>(
-          mesh, pumipic_ptcls->capacity());
+          mesh, pumipic_ptcls->capacity(), estimator);
 
   printf("PumiPIC Mesh and data structure created with %d and %d as particle "
          "structure capacity\n",

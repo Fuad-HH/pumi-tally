@@ -19,9 +19,10 @@ PumiTally::~PumiTally() {
 }
 
 PumiTally::PumiTally(const std::string &mesh_filename,
-                     const int32_t num_particles, int &argc, char **&argv)
+                     const int32_t num_particles, int &argc, char **&argv,
+                     const Estimator estimator)
     : pimpl_(std::make_unique<PumiTallyImpl>(mesh_filename, num_particles, argc,
-                                             argv)) {}
+                                             argv, estimator)) {}
 
 void PumiTally::CopyInitialPosition(double *init_particle_positions,
                                     const std::int32_t size) const {

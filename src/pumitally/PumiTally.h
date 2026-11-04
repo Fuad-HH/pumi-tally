@@ -24,6 +24,16 @@ struct ParticleAtElemBoundary;
 struct PumiTallyImpl;
 
 /**
+ * @brief Flux estimator used to score the tally
+ * @details
+ * - TrackLength: scores `weight * track_length` of every track segment
+ * - Collision: scores `weight` at the destination of every move, the collision
+ * site. The physics code passes `w / Sigma_t` as the weight of particles that
+ * collide and 0 for the ones that do not (e.g. surface crossings).
+ */
+enum class Estimator { TrackLength, Collision };
+
+/**
  * @brief PUMI-Tally Interface Class
  * @details Provides user interface to call directly from physics application.
  * All functions take C++ builtin variable types for robustness. All PUMI-PiC
@@ -41,6 +51,7 @@ public:
    * @param num_particles Actual number of particles
    * @param argc Program argc
    * @param argv Program argv
+   * @param estimator Flux estimator to tally with
    *
    * @note The mesh file name should end like `*.osh`, not `*.osh/`.
    * Autocomplete may sometimes add a `/` with the mesh name since Omega_h
@@ -48,7 +59,7 @@ public:
    * @n `argc` and `argv` are takes for MPI and Kokkos inputs.
    */
   PumiTally(const std::string &mesh_filename, int32_t num_particles, int &argc,
-            char **&argv);
+            char **&argv, Estimator estimator = Estimator::TrackLength);
 
   /**
    * Perform the is_initial_track search
@@ -82,6 +93,7 @@ public:
    * locations
    * @param flying If the particles are flying in this step 1-flying 0-stopped
    * @param weights Weight of particle (multiplied when tallying), usually [0,1]
+   * For the collision estimator it is `w / Sigma_t` (0 if no collision).
    * @param size Number of particles
    *
    * @details

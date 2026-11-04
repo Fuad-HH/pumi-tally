@@ -12,6 +12,8 @@
 
 #include <memory>
 
+#include "PumiTally.h"
+
 namespace pumitally {
 
 class P1TallySolver;
@@ -52,8 +54,10 @@ struct ParticleAtElemBoundary {
    * Allocates tally and other arrays and builds the P1 mass matrix solver
    * @param mesh Omega_h mesh the particles are tracked on
    * @param capacity PUMI-PiC Particle DS capacity
+   * @param estimator Flux estimator to tally with
    */
-  ParticleAtElemBoundary(Omega_h::Mesh &mesh, Omega_h::LO capacity);
+  ParticleAtElemBoundary(Omega_h::Mesh &mesh, Omega_h::LO capacity,
+                         Estimator estimator);
 
   /**
    * @brief This operator is called by the ParticleTracer to do user defined
@@ -103,24 +107,30 @@ struct ParticleAtElemBoundary {
   void UpdatePreviousXPoints(PPPS *ptcls) const;
 
   /**
-   * Calculate track-length estimated flux
+   * Calculate track-length or collision estimated flux
    * @param ptcls PUMI-PiC Particle DS
    * @param xpoints Current intersection points (flat: x0,y0,z0,x1,y1,z1,...)
    * @param elem_ids Current element ID
+   * @param last_exit Last exit face, -1 if the particle reached its destination
    * @param ptcl_done If particle tracking is done for this step
    *
    * @details
-   * Calculates the tracks segment length inside the current element and
-   * it is multiplied with the particle weight before accumulating in the tally
+   * Track-length: calculates the tracks segment length inside the current
+   * element and it is multiplied with the particle weight before accumulating
+   * in the tally
+   * @n Collision: only particles that reached their destination (the collision
+   * site) in the current element score, and the score is the particle weight.
    * @n The same score is also distributed to the four vertices of the element
    * with the P1 basis functions evaluated at the segment midpoint (exact for
-   * linear basis functions along a straight segment) and accumulated in the
-   * P1 load vector @ref p1_rhs.
+   * linear basis functions along a straight segment), or at the collision site
+   * for the collision estimator, and accumulated in the P1 load vector
+   * @ref p1_rhs.
    *
    * @see operator()
    */
   void EvaluateFlux(PPPS *ptcls, const Omega_h::Write<Omega_h::Real> &xpoints,
                     const Omega_h::Write<Omega_h::LO> &elem_ids,
+                    const Omega_h::Write<Omega_h::LO> &last_exit,
                     const Omega_h::Write<Omega_h::LO> &ptcl_done) const;
 
   /**
@@ -206,6 +216,7 @@ struct ParticleAtElemBoundary {
   void MarkAsInitial(bool is_initial);
 
   bool is_initial_track; //!< in is_initial_track run, flux is not tallied
+  Estimator estimator;   //!< Flux estimator to tally with
   Omega_h::Write<Omega_h::Real> flux;     //!< Current batch flux tally array
   Omega_h::Write<Omega_h::Real> flux_sum; //!< Sum of the per batch fluxes
   Omega_h::Write<Omega_h::Real>
@@ -236,6 +247,7 @@ struct ParticleAtElemBoundary {
 struct PumiTallyImpl {
   Omega_h::LO num_particles = 1e5; //!< Number of Particles
   std::string oh_mesh_filename;    //!< Omega_h mesh file name
+  Estimator estimator = Estimator::TrackLength; //!< Flux estimator
 
   Omega_h::Library oh_lib; //!< Omega_h Library (Holds MPI Comm)
   Omega_h::Mesh full_mesh; //!< Full mesh before partition
@@ -269,7 +281,8 @@ struct PumiTallyImpl {
   TallyTimes tally_times; //!< Struct to hold times for different operations
 
   PumiTallyImpl(const std::string &mesh_filename, Omega_h::LO num_ptcls,
-                int argc, char **argv);
+                int argc, char **argv,
+                Estimator estimator = Estimator::TrackLength);
 
   ~PumiTallyImpl();
 
