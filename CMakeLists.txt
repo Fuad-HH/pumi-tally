@@ -183,6 +183,9 @@ if(PUMITALLY_ENABLE_DEGAS2)
             ${CMAKE_CURRENT_SOURCE_DIR}/src/physics/degas2/DG2Physics.h
       DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/pumitally/physics/degas2
     )
+    install(TARGETS degas2
+      RUNTIME DESTINATION   ${CMAKE_INSTALL_BINDIR}
+    )
 endif()
 
 ###################################################################
