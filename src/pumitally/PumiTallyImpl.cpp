@@ -752,6 +752,41 @@ allocate_tally_view(const std::string &label, Omega_h::LO spatial_extent,
         std::to_string(bins.size()));
   }
 }
+
+// Writes all filter bins of spatial entry `ent` of `tally` (rank 1+n_filt),
+// multiplied by `scale`, to `out` in row-major order starting at `idx`.
+// Reads go through the view's operator(), so any layout is handled.
+KOKKOS_INLINE_FUNCTION void
+write_tally_entry(const Kokkos::DynRankView<double, PPExeSpace> &tally,
+                  const uint n_filt, const Omega_h::LO ent, const double scale,
+                  const Omega_h::Write<Omega_h::Real> &out, Omega_h::LO idx) {
+  switch (n_filt) {
+  case 1:
+    for (size_t b0 = 0; b0 < tally.extent(1); ++b0)
+      out[idx++] = tally(ent, b0) * scale;
+    break;
+  case 2:
+    for (size_t b0 = 0; b0 < tally.extent(1); ++b0)
+      for (size_t b1 = 0; b1 < tally.extent(2); ++b1)
+        out[idx++] = tally(ent, b0, b1) * scale;
+    break;
+  case 3:
+    for (size_t b0 = 0; b0 < tally.extent(1); ++b0)
+      for (size_t b1 = 0; b1 < tally.extent(2); ++b1)
+        for (size_t b2 = 0; b2 < tally.extent(3); ++b2)
+          out[idx++] = tally(ent, b0, b1, b2) * scale;
+    break;
+  case 4:
+    for (size_t b0 = 0; b0 < tally.extent(1); ++b0)
+      for (size_t b1 = 0; b1 < tally.extent(2); ++b1)
+        for (size_t b2 = 0; b2 < tally.extent(3); ++b2)
+          for (size_t b3 = 0; b3 < tally.extent(4); ++b3)
+            out[idx++] = tally(ent, b0, b1, b2, b3) * scale;
+    break;
+  default:
+    break;
+  }
+}
 } // namespace
 
 // ==========================================================================
@@ -1172,23 +1207,19 @@ void ParticleAtElemBoundary::FinalizeTallies(
   // Attach volume tag
   full_mesh.add_tag(Omega_h::REGION, "volume", 1, Omega_h::Reals(tet_volumes));
 
-  // Host mirror of volumes for normalization
-  auto vols_host = Omega_h::HostRead<Omega_h::Real>(Omega_h::Reals(tet_volumes));
-
   // 2. Multi-dimensional element tally normalized by element volume
   if (element_tally_spec.is_initialized) {
     const auto &spec = element_tally_spec;
-    auto elem_data = element_tallies.data();
-    Omega_h::HostWrite<Omega_h::Real> elem_host(nelem * spec.total_filter_bins,
-                                                 "element_tally_host");
-    for (Omega_h::LO e = 0; e < nelem; ++e) {
-      const double inv_vol = (vols_host[e] > 0.0) ? 1.0 / vols_host[e] : 0.0;
-      for (unsigned int c = 0; c < spec.total_filter_bins; ++c) {
-        elem_host[e * spec.total_filter_bins + c] =
-            elem_data[e * spec.total_filter_bins + c] * inv_vol;
-      }
-    }
-    Omega_h::Write<Omega_h::Real> elem_write(elem_host);
+    const auto nbins = spec.total_filter_bins;
+    const uint n_filt = spec.GetNumFilters();
+    const auto elem_view = element_tallies;
+    Omega_h::Write<Omega_h::Real> elem_write(nelem * nbins,
+                                             "element_tally_normalized");
+    auto normalize_elem = OMEGA_H_LAMBDA(const Omega_h::LO e) {
+      const double inv_vol = (tet_volumes[e] > 0.0) ? 1.0 / tet_volumes[e] : 0.0;
+      write_tally_entry(elem_view, n_filt, e, inv_vol, elem_write, e * nbins);
+    };
+    Omega_h::parallel_for(nelem, normalize_elem, "normalize element tally");
     full_mesh.add_tag(Omega_h::REGION, "element_tally",
                       static_cast<int>(spec.total_filter_bins),
                       Omega_h::Reals(elem_write));
@@ -1201,16 +1232,15 @@ void ParticleAtElemBoundary::FinalizeTallies(
   // Not volume-normalized because it is already normalized in the flux evaluation loop
   if (node_tally_spec.is_initialized) {
     const auto &spec = node_tally_spec;
-    auto node_data = node_tallies.data();
-    Omega_h::HostWrite<Omega_h::Real> node_host(
-        num_vertices * spec.total_filter_bins, "node_tally_host");
-    for (Omega_h::LO v = 0; v < num_vertices; ++v) {
-      for (unsigned int c = 0; c < spec.total_filter_bins; ++c) {
-        node_host[v * spec.total_filter_bins + c] =
-            node_data[v * spec.total_filter_bins + c];
-      }
-    }
-    Omega_h::Write<Omega_h::Real> node_write(node_host);
+    const auto nbins = spec.total_filter_bins;
+    const uint n_filt = spec.GetNumFilters();
+    const auto node_view = node_tallies;
+    Omega_h::Write<Omega_h::Real> node_write(num_vertices * nbins,
+                                             "node_tally");
+    auto copy_node = OMEGA_H_LAMBDA(const Omega_h::LO v) {
+      write_tally_entry(node_view, n_filt, v, 1.0, node_write, v * nbins);
+    };
+    Omega_h::parallel_for(num_vertices, copy_node, "copy node tally");
     full_mesh.add_tag(Omega_h::VERT, "node_tally",
                       static_cast<int>(spec.total_filter_bins),
                       Omega_h::Reals(node_write));
@@ -1580,7 +1610,7 @@ std::unique_ptr<PPPS> CreateParticleDSForWall(
   constexpr double Smax = 1e20;       // particles per m² per second
   constexpr double lambda = 0.05;     // decay length (m)
 
-  std::vector<double> source_strength(ne, 0.0);
+  Kokkos::View<double *, Kokkos::HostSpace> source_strength("source_strength", ne);
   double total_source = 0.0;
 
   for (Omega_h::LO e = 0; e < ne; ++e) {
@@ -1597,9 +1627,9 @@ std::unique_ptr<PPPS> CreateParticleDSForWall(
     cz /= 4.0;
     const double R = std::sqrt(cx * cx + cz * cz);
 
-    source_strength[e] =
+    source_strength(e) =
         Smax * std::exp(-(R - Rmin) / lambda) / wall_area[e];
-    total_source += source_strength[e];
+    total_source += source_strength(e);
   }
 
   if (total_source <= 0.0) {
@@ -1609,40 +1639,54 @@ std::unique_ptr<PPPS> CreateParticleDSForWall(
   // ---- distribute particles proportionally ----
   pumitally::PPPS::kkLidView ptcls_per_elem("ptcls_per_elem", ne);
   pumitally::PPPS::kkGidView element_gids("element_gids", ne);
-  Omega_h::parallel_for(
-      ne, OMEGA_H_LAMBDA(const Omega_h::LO &i) {
-        element_gids(i) = i;
-        ptcls_per_elem(i) = 0;
-      });
+  const auto source_strength_d = Kokkos::create_mirror_view_and_copy(
+      pumitally::PPPS::kkLidView::memory_space{}, source_strength);
 
   Omega_h::LO tot_assigned = 0;
-  for (Omega_h::LO e = 0; e < ne; ++e) {
-    if (source_strength[e] > 0.0) {
-      const Omega_h::LO n =
-          static_cast<Omega_h::LO>(std::round(num_ptcls * source_strength[e] /
-                                              total_source));
-      ptcls_per_elem(e) = n;
-      tot_assigned += n;
-    }
-  }
+  Kokkos::parallel_reduce(
+      "wall_ptcls_per_elem", ne,
+      KOKKOS_LAMBDA(const Omega_h::LO e, Omega_h::LO &sum) {
+        element_gids(e) = e;
+        Omega_h::LO n = 0;
+        if (source_strength_d(e) > 0.0) {
+          n = static_cast<Omega_h::LO>(Kokkos::round(
+              num_ptcls * source_strength_d(e) / total_source));
+        }
+        ptcls_per_elem(e) = n;
+        sum += n;
+      },
+      tot_assigned);
 
   // ---- rounding adjustment (round-robin over wall elements) ----
+  // The k-th source element receives remaining/n_src hits, plus one more if
+  // k < remaining % n_src. Removal is clamped at zero.
   int extra = static_cast<int>(num_ptcls) - static_cast<int>(tot_assigned);
   if (extra != 0) {
     const int add_remove = (extra > 0) ? 1 : -1;
-    int remaining = std::abs(extra);
-    // collect wall element indices
-    std::vector<Omega_h::LO> wall_elems;
-    wall_elems.reserve(n_wall);
-    for (Omega_h::LO e = 0; e < ne; ++e) {
-      if (source_strength[e] > 0.0) wall_elems.push_back(e);
-    }
-    for (int i = 0; i < remaining; ++i) {
-      const Omega_h::LO e = wall_elems[i % wall_elems.size()];
-      if (add_remove > 0 || ptcls_per_elem(e) > 0) {
-        Kokkos::atomic_add(&ptcls_per_elem(e), add_remove);
-      }
-    }
+    const int remaining = std::abs(extra);
+    Omega_h::LO n_src = 0;
+    Kokkos::parallel_reduce(
+        "wall_count_src", ne,
+        KOKKOS_LAMBDA(const Omega_h::LO e, Omega_h::LO &cnt) {
+          if (source_strength_d(e) > 0.0) ++cnt;
+        },
+        n_src);
+    const int base = remaining / n_src;
+    const int rem = remaining % n_src;
+    Kokkos::parallel_scan(
+        "wall_round_robin", ne,
+        KOKKOS_LAMBDA(const Omega_h::LO e, Omega_h::LO &k, const bool final) {
+          const bool is_src = source_strength_d(e) > 0.0;
+          if (final && is_src) {
+            const int hits = base + (k < rem ? 1 : 0);
+            if (add_remove > 0) {
+              ptcls_per_elem(e) += hits;
+            } else {
+              ptcls_per_elem(e) = Kokkos::max(0, ptcls_per_elem(e) - hits);
+            }
+          }
+          if (is_src) ++k;
+        });
   }
 
   printf("[INFO] Wall source: %d boundary elements, total source %.6e, "
